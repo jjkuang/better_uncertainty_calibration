@@ -1,9 +1,11 @@
 import numpy as np
+import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import softmax
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import label_binarize
 from errors import BS, NLL, accuracy
+from utils import logits_RC_to_pkl, logits_OOD_to_pkl
 
 # taken and modified from TODO
 class TemperatureScaling():
@@ -197,3 +199,46 @@ class FlawedRecal():
         probs = np.zeros(logits.shape) + (1-self.acc)/(logits.shape[1]-1)
         probs[np.arange(logits.shape[0]), arg] = self.acc
         return logistic_func(probs)
+
+
+def fit_logits_scale(results, metrics_df, new_logits_path, adv_results=None):
+    # The model will be scaled using the trained dataset distribution (ImageNet-1k)
+    # But we will generate the "re-calibrated" test logits from the OOD dataset
+    logits_test, labels_test = results[0] if adv_results is None else adv_results[0] # for actual test
+    logits_val, labels_val = results[1] # for TS calibration
+    labels_val = np.expand_dims(labels_val, axis=1)
+    n = logits_test.shape[0]      
+
+    # if method == 'TS':
+    #     RC_model = TemperatureScaling()
+    # elif method == 'ETS':
+    #     RC_model = ETScaling()
+    # else:
+    #     raise NotImplementedError()
+    RC_model = TemperatureScaling()
+
+    logits_test = np.nan_to_num(logits_test, nan=1e-6)
+    logits_val = np.nan_to_num(logits_val, nan=1e-6)
+
+    RC_model.fit(logits_val, labels_val)
+    logits_test_RC = RC_model.predict(logits_test)
+
+    logits_RC_to_pkl(logits_test, logits_test_RC, labels_test, new_logits_path)
+    metrics_df['RC_probs_path'] = new_logits_path
+
+    return metrics_df
+
+
+def save_aupr_logits(metrics_df, new_logits_path, iid_results, ood_results):
+    # ImageNet-O results require both IID and OOD logits saved in addition to calibration results
+    logits_test_iid, labels_test_iid = iid_results[0]  # for actual test
+    logits_test_ood, labels_test_ood = ood_results[0]  # for actual test
+
+    logits_test_iid = np.nan_to_num(logits_test_iid, nan=1e-6)
+    logits_test_ood = np.nan_to_num(logits_test_ood, nan=1e-6)
+
+    logits_OOD_to_pkl(logits_test_iid, logits_test_ood, labels_test_iid, labels_test_ood, new_logits_path)
+    metrics_df['ood_probs_path'] = new_logits_path
+
+    return metrics_df
+

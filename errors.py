@@ -1,9 +1,9 @@
 import bisect
 import numpy as np
-import torch
-from netcal.metrics import MMCE as _MMCE
+# import torch
+# from netcal.metrics import MMCE as _MMCE
 from scipy.special import softmax
-from sklearn.metrics import log_loss, mean_squared_error, accuracy_score
+from sklearn.metrics import log_loss, mean_squared_error, accuracy_score, average_precision_score
 from sklearn.preprocessing import label_binarize
 from typing import List, Tuple, TypeVar
 try:
@@ -142,7 +142,7 @@ def lower_bound_scaling_top_ce(probs, labels, p=2, debias=True, num_bins=15,
 
 
 def lower_bound_scaling_ce(probs, labels, p=2, debias=True, num_bins=15,
-                           binning_scheme=equal_mass_bins, mode='marginal'):
+                           binning_scheme=equal_mass_bins, mode='marginal', return_bins=False):
     """Lower bound the calibration error of a model with continuous outputs.
     Args:
         probs: A numpy array of shape (n,) or (n, k). If the shape is (n,) then
@@ -167,7 +167,8 @@ def lower_bound_scaling_ce(probs, labels, p=2, debias=True, num_bins=15,
         For scaling methods we cannot estimate the calibration error, but only a
         lower bound.
     """
-    return _get_ce(probs, labels, p, debias, num_bins, binning_scheme, mode=mode)
+    return _get_ce(probs, labels, p, debias, num_bins, binning_scheme, 
+                   mode=mode, return_bins=return_bins)
 
 
 def get_binning_top_ce(probs, labels, p=2, debias=True, mode='marginal'):
@@ -197,16 +198,21 @@ def get_binning_ce(probs, labels, p=2, debias=True, mode='marginal'):
     return _get_ce(probs, labels, p, debias, None, binning_scheme=get_discrete_bins, mode=mode)
 
 
+def get_acc_conf_bins(probs, labels, debias=False, num_bins=15, mode='top-label'):
+    return lower_bound_scaling_ce(probs, labels, p=1, debias=debias, num_bins=num_bins,
+                                  binning_scheme=equal_width_bins, mode=mode, return_bins=True)
+
+
 def get_ece(probs, labels, debias=False, num_bins=15, mode='top-label'):
     return lower_bound_scaling_ce(probs, labels, p=1, debias=debias, num_bins=num_bins,
                                   binning_scheme=equal_width_bins, mode=mode)
 
 
-def _get_ce(probs, labels, p, debias, num_bins, binning_scheme, mode='marginal'):
+def _get_ce(probs, labels, p, debias, num_bins, binning_scheme, mode='marginal', return_bins=False):
     def ce_1d(probs, labels):
         assert probs.shape == labels.shape
         assert len(probs.shape) == 1
-        data = list(zip(probs, labels))
+        data = list(zip(probs, labels)) # would be confidences, correct in ece top-label case
         if binning_scheme == get_discrete_bins:
             assert(num_bins is None)
             bins = binning_scheme(probs)
@@ -218,7 +224,10 @@ def _get_ce(probs, labels, p, debias, num_bins, binning_scheme, mode='marginal')
             raise NotImplementedError('TODO: Fix power')
             # return normal_debiased_ce(bin(data, bins), power=p)
         else:
-            return plugin_ce(bin(data, bins), power=p)
+            if return_bins:
+                return get_ece_and_binned_data(bin(data, bins), power=p)
+            else:
+                return plugin_ce(bin(data, bins), power=p)
     if mode != 'marginal' and mode != 'top-label':
         raise ValueError("mode must be 'marginal' or 'top-label'.")
     probs = np.array(probs)
@@ -253,7 +262,7 @@ def _get_ce(probs, labels, p, debias, num_bins, binning_scheme, mode='marginal')
             preds = get_top_predictions(probs)
             correct = (preds == labels).astype(probs.dtype)
             confidences = get_top_probs(probs)
-            return ce_1d(confidences, correct)
+            return ce_1d(confidences, correct) # !!! follow me
     else:
         raise ValueError('probs should be a 1D or 2D numpy array.')
 
@@ -332,8 +341,15 @@ def plugin_ce(binned_data: BinnedData, power=2) -> float:
         return abs(difference_mean(data)) ** power
     bin_probs = get_bin_probs(binned_data)
     bin_errors = list(map(bin_error, binned_data))
+    # Might need to step in here to make sure I get accuracy and confidence?
     return np.dot(bin_probs, bin_errors)  # ** (1.0 / power)
 
+def get_ece_and_binned_data(binned_data: BinnedData, power=2) -> float:
+    bin_confs = list(map(lambda b: np.mean(b[:,0]), binned_data))
+    bin_accs  = list(map(lambda b: sum(b[:,1])/len(b) if len(b) > 0 else 0, binned_data))
+    all_confs = [datum[0] for bin_data in binned_data for datum in bin_data]
+    # Might need to step in here to make sure I get accuracy and confidence?
+    return bin_accs, bin_confs, all_confs  # ** (1.0 / power)
 
 def unbiased_square_ce(binned_data: BinnedData) -> float:
     # Note, this is not the l2 CE. It does not take the square root.
@@ -499,6 +515,17 @@ def sECE(logits, labels, bins=15):
         binning_scheme=equal_width_bins)**2
 
 
+def ECE(logits, labels, bins=15):
+    return lower_bound_scaling_ce(
+        softmax(logits, axis=1),
+        labels.flatten(),
+        p=1,
+        num_bins=bins,
+        debias=False,
+        mode='top-label',
+        binning_scheme=equal_width_bins)
+
+
 def sCWCE(logits, labels, bins=15):
     return lower_bound_scaling_ce(
         softmax(logits, axis=1),
@@ -519,6 +546,12 @@ def BS(logits, labels):
     p = softmax(logits, axis=1)
     y = label_binarize(np.array(labels), classes=range(logits.shape[1]))
     return np.average(np.sum((p - y)**2, axis=1))
+
+
+def rBS(logits, labels):
+    p = softmax(logits, axis=1)
+    y = label_binarize(np.array(labels), classes=range(logits.shape[1]))
+    return np.average(np.sum((p - y)**2, axis=1)) ** .5
 
 
 def QdRBS(logits, labels):
@@ -555,8 +588,13 @@ def QBSRBS(logits, labels):
 
 
 def NLL(logits, labels):
+    if len(logits.shape) < 2:
+        logits = np.expand_dims(logits, axis=0)
     p = softmax(logits, axis=1)
-    return log_loss(labels, p)
+    n_classes = logits.shape[1]
+    # specify labels arg because not every class is used in the test set I generated
+    # p = np.nan_to_num(p, copy=True)
+    return log_loss(labels, p, labels=np.array(range(0,n_classes)), eps=1e-8)
 
 
 def mirror_1d(d, xmin=None, xmax=None):
@@ -571,102 +609,163 @@ def mirror_1d(d, xmin=None, xmax=None):
     else:
         return d
 
+"""
+The functions below are taken from https://github.com/hendrycks/natural-adv-examples/blob/master/calibration_tools.py
+"""
+
+def aurra(confidence, correct, curve=False):
+    conf_ranks = np.argsort(confidence)[::-1]  # indices from greatest to least confidence
+    rra_curve = np.cumsum(np.asarray(correct)[conf_ranks])
+    rra_curve = rra_curve / np.arange(1, len(rra_curve) + 1)  # accuracy at each response rate, PER logit
+    # the verification is rra_curve[-1] == accuracy
+    if curve:
+        return rra_curve
+    else:
+        return np.mean(rra_curve)
+
+
+recall_level_default = 0.95
+def aupr(_pos, _neg, recall_level=recall_level_default):
+    pos = np.array(_pos[:]).reshape((-1, 1)) # i.e. our in-disn
+    neg = np.array(_neg[:]).reshape((-1, 1)) # i.e. our ood
+    examples = np.squeeze(np.vstack((pos, neg)))
+    labels = np.zeros(len(examples), dtype=np.int32) # artificially create our pos/neg labels
+    labels[:len(pos)] += 1
+
+    # auroc = sk.roc_auc_score(labels, examples)
+    # fpr = fpr_and_fdr_at_recall(labels, examples, recall_level)
+
+    return average_precision_score(labels, examples)
+
+
+def get_imagenet_o_results(id_logits, ood_logits):
+    confidence_in = get_top_probs(softmax(id_logits, axis=1)) # literally whats the max softmax prob
+    in_score = -confidence_in # positive score
+    confidence_out = get_top_probs(softmax(ood_logits, axis=1))
+    out_score = -confidence_out # negative score
+
+    return aupr(out_score, in_score)
+
+
+def get_imagenet_a_results(logits, labels, curve=False):
+    probs = softmax(logits, axis=1)
+
+    preds = get_top_predictions(probs)
+    correct = (preds == labels).astype(probs.dtype)
+    confidence = get_top_probs(probs)
+
+    return aurra(confidence, correct, curve)  
+
+
+def get_acc_vs_conf_thr_results(logits, labels, thrs=np.linspace(0.0,0.9,10)):
+    probs = softmax(logits, axis=1)
+    preds = get_top_predictions(probs)
+    confidence = get_top_probs(probs)
+    correct = (preds == labels).astype(probs.dtype)
+
+    acc_vs_conf_thr = {}
+    for thr in thrs:
+        conf_over_thr = (confidence > thr).astype(probs.dtype)
+        acc_vs_conf_thr[f"{thr:.2f}"] = np.sum(correct * conf_over_thr) / (np.sum(conf_over_thr)+1e-8)
+
+    return acc_vs_conf_thr
+
 
 # taken from https://github.com/zhang64-llnl/Mix-n-Match-Calibration/blob/master/util_evaluation.py
-def sKDECE(logits, labels, p_int=None, order=2):
+# def sKDECE(logits, labels, p_int=None, order=2):
 
-    p = softmax(logits, axis=1)
-    # to 1-hot
-    label = label_binarize(np.array(labels), classes=range(p.shape[1]))
+#     p = softmax(logits, axis=1)
+#     # to 1-hot
+#     label = label_binarize(np.array(labels), classes=range(p.shape[1]))
 
-    # points from numerical integration
-    if p_int is None:
-        p_int = np.copy(p)
+#     # points from numerical integration
+#     if p_int is None:
+#         p_int = np.copy(p)
 
-    p = np.clip(p,1e-256,1-1e-256)
-    p_int = np.clip(p_int,1e-256,1-1e-256)
-
-
-    x_int = np.linspace(-0.6, 1.6, num=2**14)
+#     p = np.clip(p,1e-256,1-1e-256)
+#     p_int = np.clip(p_int,1e-256,1-1e-256)
 
 
-    N = p.shape[0]
-
-    # this is needed to convert labels from one-hot to conventional form
-    label_index = np.array([np.where(r==1)[0][0] for r in label])
-    with torch.no_grad():
-        if p.shape[1] !=2:
-            p_new = torch.from_numpy(p)
-            p_b = torch.zeros(N,1)
-            label_binary = np.zeros((N,1))
-            for i in range(N):
-                pred_label = int(torch.argmax(p_new[i]).numpy())
-                if pred_label == label_index[i]:
-                    label_binary[i] = 1
-                p_b[i] = p_new[i,pred_label]/torch.sum(p_new[i,:])
-        else:
-            p_b = torch.from_numpy((p/np.sum(p,1)[:,None])[:,1])
-            label_binary = label_index
-
-    method = 'triweight'
-
-    dconf_1 = (p_b[np.where(label_binary==1)].reshape(-1,1)).numpy()
-    kbw = np.std(p_b.numpy())*(N*2)**-0.2
-    kbw = np.std(dconf_1)*(N*2)**-0.2
-    # Mirror the data about the domain boundary
-    low_bound = 0.0
-    up_bound = 1.0
-    dconf_1m = mirror_1d(dconf_1,low_bound,up_bound)
-    # Compute KDE using the bandwidth found, and twice as many grid points
-    pp1 = FFTKDE(bw=kbw, kernel=method).fit(dconf_1m).evaluate(x_int)
-    pp1[x_int<=low_bound] = 0  # Set the KDE to zero outside of the domain
-    pp1[x_int>=up_bound] = 0  # Set the KDE to zero outside of the domain
-    pp1 = pp1 * 2  # Double the y-values to get integral of ~1
+#     x_int = np.linspace(-0.6, 1.6, num=2**14)
 
 
-    p_int = p_int/np.sum(p_int,1)[:,None]
-    N1 = p_int.shape[0]
-    with torch.no_grad():
-        p_new = torch.from_numpy(p_int)
-        pred_b_int = np.zeros((N1,1))
-        if p_int.shape[1]!=2:
-            for i in range(N1):
-                pred_label = int(torch.argmax(p_new[i]).numpy())
-                pred_b_int[i] = p_int[i,pred_label]
-        else:
-            for i in range(N1):
-                pred_b_int[i] = p_int[i,1]
+#     N = p.shape[0]
 
-    low_bound = 0.0
-    up_bound = 1.0
-    pred_b_intm = mirror_1d(pred_b_int,low_bound,up_bound)
-    # Compute KDE using the bandwidth found, and twice as many grid points
-    pp2 = FFTKDE(bw=kbw, kernel=method).fit(pred_b_intm).evaluate(x_int)
-    pp2[x_int<=low_bound] = 0  # Set the KDE to zero outside of the domain
-    pp2[x_int>=up_bound] = 0  # Set the KDE to zero outside of the domain
-    pp2 = pp2 * 2  # Double the y-values to get integral of ~1
+#     # this is needed to convert labels from one-hot to conventional form
+#     label_index = np.array([np.where(r==1)[0][0] for r in label])
+#     with torch.no_grad():
+#         if p.shape[1] !=2:
+#             p_new = torch.from_numpy(p)
+#             p_b = torch.zeros(N,1)
+#             label_binary = np.zeros((N,1))
+#             for i in range(N):
+#                 pred_label = int(torch.argmax(p_new[i]).numpy())
+#                 if pred_label == label_index[i]:
+#                     label_binary[i] = 1
+#                 p_b[i] = p_new[i,pred_label]/torch.sum(p_new[i,:])
+#         else:
+#             p_b = torch.from_numpy((p/np.sum(p,1)[:,None])[:,1])
+#             label_binary = label_index
+
+#     method = 'triweight'
+
+#     dconf_1 = (p_b[np.where(label_binary==1)].reshape(-1,1)).numpy()
+#     kbw = np.std(p_b.numpy())*(N*2)**-0.2
+#     kbw = np.std(dconf_1)*(N*2)**-0.2
+#     # Mirror the data about the domain boundary
+#     low_bound = 0.0
+#     up_bound = 1.0
+#     dconf_1m = mirror_1d(dconf_1,low_bound,up_bound)
+#     # Compute KDE using the bandwidth found, and twice as many grid points
+#     pp1 = FFTKDE(bw=kbw, kernel=method).fit(dconf_1m).evaluate(x_int)
+#     pp1[x_int<=low_bound] = 0  # Set the KDE to zero outside of the domain
+#     pp1[x_int>=up_bound] = 0  # Set the KDE to zero outside of the domain
+#     pp1 = pp1 * 2  # Double the y-values to get integral of ~1
 
 
-    if p.shape[1] !=2: # top label (confidence)
-        perc = np.mean(label_binary)
-    else: # or joint calibration for binary cases
-        perc = np.mean(label_index)
+#     p_int = p_int/np.sum(p_int,1)[:,None]
+#     N1 = p_int.shape[0]
+#     with torch.no_grad():
+#         p_new = torch.from_numpy(p_int)
+#         pred_b_int = np.zeros((N1,1))
+#         if p_int.shape[1]!=2:
+#             for i in range(N1):
+#                 pred_label = int(torch.argmax(p_new[i]).numpy())
+#                 pred_b_int[i] = p_int[i,pred_label]
+#         else:
+#             for i in range(N1):
+#                 pred_b_int[i] = p_int[i,1]
 
-    integral = np.zeros(x_int.shape)
-    reliability= np.zeros(x_int.shape)
-    for i in range(x_int.shape[0]):
-        conf = x_int[i]
-        if np.max([pp1[np.abs(x_int-conf).argmin()],pp2[np.abs(x_int-conf).argmin()]])>1e-6:
-            accu = np.min([perc*pp1[np.abs(x_int-conf).argmin()]/pp2[np.abs(x_int-conf).argmin()],1.0])
-            if np.isnan(accu)==False:
-                integral[i] = np.abs(conf-accu)**order*pp2[i]
-                reliability[i] = accu
-        else:
-            if i>1:
-                integral[i] = integral[i-1]
+#     low_bound = 0.0
+#     up_bound = 1.0
+#     pred_b_intm = mirror_1d(pred_b_int,low_bound,up_bound)
+#     # Compute KDE using the bandwidth found, and twice as many grid points
+#     pp2 = FFTKDE(bw=kbw, kernel=method).fit(pred_b_intm).evaluate(x_int)
+#     pp2[x_int<=low_bound] = 0  # Set the KDE to zero outside of the domain
+#     pp2[x_int>=up_bound] = 0  # Set the KDE to zero outside of the domain
+#     pp2 = pp2 * 2  # Double the y-values to get integral of ~1
 
-    ind = np.where((x_int >= 0.0) & (x_int <= 1.0))
-    return np.trapz(integral[ind],x_int[ind])/np.trapz(pp2[ind],x_int[ind])
+
+#     if p.shape[1] !=2: # top label (confidence)
+#         perc = np.mean(label_binary)
+#     else: # or joint calibration for binary cases
+#         perc = np.mean(label_index)
+
+#     integral = np.zeros(x_int.shape)
+#     reliability= np.zeros(x_int.shape)
+#     for i in range(x_int.shape[0]):
+#         conf = x_int[i]
+#         if np.max([pp1[np.abs(x_int-conf).argmin()],pp2[np.abs(x_int-conf).argmin()]])>1e-6:
+#             accu = np.min([perc*pp1[np.abs(x_int-conf).argmin()]/pp2[np.abs(x_int-conf).argmin()],1.0])
+#             if np.isnan(accu)==False:
+#                 integral[i] = np.abs(conf-accu)**order*pp2[i]
+#                 reliability[i] = accu
+#         else:
+#             if i>1:
+#                 integral[i] = integral[i-1]
+
+#     ind = np.where((x_int >= 0.0) & (x_int <= 1.0))
+#     return np.trapz(integral[ind],x_int[ind])/np.trapz(pp2[ind],x_int[ind])
 
 
 # taken from https://github.com/kartikgupta-at-anu/spline-calibration/blob/master/cal_metrics/KS.py
@@ -719,7 +818,7 @@ def sKSCE(logits, labels):
     return KS_error_max
 
 
-def MMCE(logits, labels):
-    mmce = _MMCE()
-    scores = softmax(logits, axis=1)
-    return mmce.measure(scores, labels)
+# def MMCE(logits, labels):
+#     mmce = _MMCE()
+#     scores = softmax(logits, axis=1)
+#     return mmce.measure(scores, labels)
